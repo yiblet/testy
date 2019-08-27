@@ -1,0 +1,10 @@
+[package]
+name = "testy"
+version = "0.1.0"
+authors = ["Shalom Yiblet <shalom.yiblet@gmail.com>"]
+edition = "2019"
+
+[dependencies]
+clap = "2.33.0"
+ropey = "1.0.1"
+tui = "0.6.2"
