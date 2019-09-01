@@ -1,48 +1,83 @@
-extern crate either;
+extern crate clap;
 extern crate subprocess;
 extern crate termion;
 extern crate tui;
 
+#[macro_use]
+extern crate lazy_static;
+
+mod string_err;
+use string_err::ToStringResult;
+
+mod cli;
+use cli::Cli;
+
 use std::io;
-use termion::event::{Event as UserEvent, Key, MouseEvent};
+use std::time;
+use termion::event::{Event as UserEvent, Key, MouseButton, MouseEvent};
 use termion::input::{MouseTerminal, TermRead};
 use termion::raw::IntoRawMode;
 use termion::screen::AlternateScreen;
 use tui::backend::TermionBackend;
-use tui::layout::{Constraint, Direction, Layout, Rect};
+use tui::layout::{Constraint, Direction, Layout};
 use tui::widgets::{Block, Borders, Paragraph, Text, Widget};
 use tui::Terminal;
 
-use either::Either;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use subprocess::{Popen, PopenConfig};
 
-enum Event {
-    UserEvent(UserEvent),
-    OutputLine(String),
+lazy_static! {
+    static ref FLAGS: Cli = Cli::parse().unwrap();
 }
 
-fn subprocess_chan(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<String>) {
+static MIN_REFRESH_RATE: std::time::Duration = std::time::Duration::from_millis(1000 / 15);
+static MIN_UPDATE_REFRESH_RATE: std::time::Duration = std::time::Duration::from_millis(15);
+
+struct State {
+    text: Vec<String>,
+    line: usize,
+}
+
+type GlobalState = Arc<Mutex<State>>;
+
+enum Event {
+    UserEvent(UserEvent),
+    Update,
+}
+
+fn subprocess_chan(
+    global_state: GlobalState,
+    tx: mpsc::Sender<(Event, time::Instant)>,
+    rx: mpsc::Receiver<String>,
+) {
     use std::sync::atomic::*;
-    use std::sync::Arc;
 
     thread::spawn(move || -> Result<(), String> {
         let mut stop_last_thread = Arc::new(AtomicBool::new(false));
         let mut last_command = String::new();
         for command in rx.iter() {
-            let thread_tx = tx.clone();
             if last_command.trim() == command.trim() {
                 continue;
             }
 
             stop_last_thread.store(true, Ordering::SeqCst);
 
+            global_state
+                .lock()
+                .map(|mut state| {
+                    state.line = 0;
+                    state.text.clear();
+                })
+                .to_string_result()?;
+
             stop_last_thread = Arc::new(AtomicBool::new(false));
 
             // things to be moved
             let stop_thread = stop_last_thread.clone();
             let new_command = command.clone();
+            let new_global_state = global_state.clone();
+            let new_tx = tx.clone();
 
             thread::spawn(move || -> Result<(), String> {
                 use std::io::prelude::*;
@@ -53,8 +88,8 @@ fn subprocess_chan(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<String>) {
                             None => Popen::create(
                                 &["bash", "-c", cmd],
                                 PopenConfig {
-                                    stderr: subprocess::Redirection::Pipe,
-                                    stdin: subprocess::Redirection::None,
+                                    stderr: subprocess::Redirection::Merge,
+                                    stdin: subprocess::Redirection::Pipe,
                                     stdout: subprocess::Redirection::Pipe,
                                     detached: true,
                                     ..PopenConfig::default()
@@ -69,7 +104,7 @@ fn subprocess_chan(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<String>) {
                                     ),
                                     detached: true,
                                     stdout: subprocess::Redirection::Pipe,
-                                    stderr: subprocess::Redirection::Pipe,
+                                    stderr: subprocess::Redirection::Merge,
                                     ..PopenConfig::default()
                                 },
                             )
@@ -84,17 +119,32 @@ fn subprocess_chan(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<String>) {
                             .as_ref()
                             .unwrap() // should never be None
                             .try_clone()
-                            .map_err(|e| e.to_string())
+                            .to_string_result()
                     })?;
 
+                let mut last_update = time::Instant::now();
                 for line in std::io::BufReader::new(output_file).lines() {
-                    let line = line.map_err(|e| e.to_string())?;
+                    let mut line = line.to_string_result()?;
+                    line.push('\n');
                     if (*stop_thread).load(Ordering::SeqCst) {
                         break;
                     }
-                    thread_tx
-                        .send(Event::OutputLine(line))
-                        .map_err(|e| e.to_string())?;
+
+                    new_global_state
+                        .lock()
+                        .map(|mut state| {
+                            state.text.push(line);
+                            if !FLAGS.no_scroll {
+                                state.line += 1
+                            }
+                        })
+                        .to_string_result()?;
+
+                    let time = time::Instant::now();
+                    if time - last_update >= MIN_UPDATE_REFRESH_RATE {
+                        last_update = time;
+                        new_tx.send((Event::Update, time)).unwrap();
+                    }
                 }
 
                 Ok(())
@@ -105,35 +155,62 @@ fn subprocess_chan(tx: mpsc::Sender<Event>, rx: mpsc::Receiver<String>) {
     });
 }
 
-fn event_chan(tx: mpsc::Sender<Event>) {
+fn event_chan(tx: mpsc::Sender<(Event, time::Instant)>) {
     thread::spawn(move || {
         let stdin = io::stdin();
         for c in stdin.events() {
-            tx.send(Event::UserEvent(c.unwrap())).unwrap();
+            let time = time::Instant::now();
+            tx.send((Event::UserEvent(c.unwrap()), time)).unwrap();
         }
     });
 }
 
-fn main() -> Result<(), String> {
+fn text(state: &mut State, num_lines: usize) -> impl Iterator<Item = &str> {
+    let len = state.text.len();
+    let start_line = if state.line == len && len > 0 {
+        len - num_lines.min(len)
+    } else {
+        state.line
+    };
+    state.line = start_line;
+    let last_line = if len == 0 { len } else { len };
+    state.text[start_line..(state.line + num_lines).min(last_line)]
+        .iter()
+        .map(|e| e.as_ref())
+}
+
+fn run() -> Result<String, String> {
     let stdout = io::stdout().into_raw_mode().unwrap();
     let stdout = MouseTerminal::from(stdout);
     let stdout = AlternateScreen::from(stdout);
     let backend = TermionBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
-    terminal.clear().map_err(|e| e.to_string())?;
-    terminal.hide_cursor();
+    let mut terminal = Terminal::new(backend).to_string_result()?;
+    terminal.clear().to_string_result()?;
+    // terminal.hide_cursor().to_string_result()?;
 
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
 
+    let global_state = Arc::new(Mutex::new(State {
+        text: Vec::new(),
+        line: 0,
+    }));
+
     event_chan(event_tx.clone());
-    subprocess_chan(event_tx.clone(), command_rx);
+    subprocess_chan(global_state.clone(), event_tx.clone(), command_rx);
 
     let mut command = String::new();
-    let mut output = String::new();
+
+    let mut last_evt = time::Instant::now();
+
+
     loop {
-        match event_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        match event_rx
+            .recv_timeout(std::time::Duration::from_millis(1000 / 2))
+            .map(|(evt, _)| evt)
+        {
             Ok(evt) => match evt {
+                Event::Update => (),
                 Event::UserEvent(usr_evt) => match usr_evt {
                     UserEvent::Key(k) => {
                         match k {
@@ -143,40 +220,84 @@ fn main() -> Result<(), String> {
                             }
                             Key::Char('\r') | Key::Char('\n') => {
                                 command_tx.send(command.clone()).unwrap();
-                                output.clear();
                             }
                             Key::Char(ch) => command.push(ch),
                             _ => (),
                         };
                     }
+                    UserEvent::Mouse(MouseEvent::Press(btn, _, _)) => match btn {
+                        MouseButton::WheelDown => {
+                            global_state
+                                .lock()
+                                .map(|mut state| {
+                                    if state.line + 1 < state.text.len() {
+                                        state.line += 1
+                                    }
+                                })
+                                .to_string_result()?;
+                        }
+                        MouseButton::WheelUp => {
+                            global_state
+                                .lock()
+                                .map(|mut state| {
+                                    if state.line != 0 {
+                                        state.line -= 1
+                                    }
+                                })
+                                .to_string_result()?;
+                        }
+                        _ => (),
+                    },
                     _ => (),
                 },
-                Event::OutputLine(line) => {
-                    output.push_str(line.as_ref());
-                    output.push('\n');
-                }
             },
             Err(mpsc::RecvTimeoutError::Disconnected) => Err("dead thread")?,
             _ => (),
         }
 
+        if time::Instant::now() - last_evt < MIN_REFRESH_RATE {
+            continue;
+        } else {
+            last_evt = time::Instant::now();
+        }
+
         terminal
-            .draw(|mut f| {
-                let text = [Text::raw(output.clone())];
+            .draw(|mut f: tui::Frame<_>| {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .margin(0)
-                    .constraints([Constraint::Length(1), Constraint::Percentage(90)].as_ref())
+                    .constraints([Constraint::Length(2), Constraint::Percentage(90)].as_ref())
                     .split(f.size());
-                let block = Block::default()
-                    .title(command.as_ref())
-                    .borders(Borders::ALL);
+
+                // title bar
+                let state = &mut global_state.lock().unwrap();
+                let title = vec![Text::raw(&command)];
+                Paragraph::new(title.iter())
+                    .block(Block::default().borders(Borders::TOP | Borders::RIGHT | Borders::LEFT))
+                    .wrap(true)
+                    .render(&mut f, chunks[0]);
+
+                // text drawing
+                let text: Vec<Text> = text(&mut *state, chunks[1].height as usize)
+                    .map(Text::raw)
+                    .collect();
                 Paragraph::new(text.iter())
-                    .block(block)
+                    .block(Block::default().borders(Borders::ALL))
                     .wrap(true)
                     .render(&mut f, chunks[1]);
             })
-            .map_err(|e| e.to_string())?;
+            .to_string_result()?;
+
+        terminal
+            .set_cursor(command.len() as u16 + 1, 1)
+            .to_string_result()?;
     }
-    Ok(())
+    Ok(command)
+}
+
+pub fn main() -> Result<(), String> {
+    FLAGS.no_scroll;
+    run().map(|command| {
+        println!("{}", command);
+    })
 }
