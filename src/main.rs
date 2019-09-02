@@ -1,4 +1,5 @@
 extern crate clap;
+extern crate crossbeam;
 extern crate subprocess;
 extern crate termion;
 extern crate tui;
@@ -31,8 +32,8 @@ lazy_static! {
     static ref FLAGS: Cli = Cli::parse().unwrap();
 }
 
-static MIN_REFRESH_RATE: std::time::Duration = std::time::Duration::from_millis(1000 / 15);
-static MIN_UPDATE_REFRESH_RATE: std::time::Duration = std::time::Duration::from_millis(15);
+static MIN_REFRESH_RATE: std::time::Duration = std::time::Duration::from_millis(1000 / 120);
+static MIN_UPDATE_REFRESH_RATE: std::time::Duration = MIN_REFRESH_RATE;
 
 struct State {
     text: Vec<String>,
@@ -48,7 +49,7 @@ enum Event {
 
 fn subprocess_chan(
     global_state: GlobalState,
-    tx: mpsc::Sender<(Event, time::Instant)>,
+    tx: crossbeam::Sender<(Event, time::Instant)>,
     rx: mpsc::Receiver<String>,
 ) {
     use std::sync::atomic::*;
@@ -80,53 +81,69 @@ fn subprocess_chan(
             let new_tx = tx.clone();
 
             thread::spawn(move || -> Result<(), String> {
+                use std::cell::RefCell;
                 use std::io::prelude::*;
-                let popen_opt = new_command
-                    .split('|')
-                    .fold(None, |acc: Option<Popen>, cmd| {
-                        (match acc {
-                            None => Popen::create(
-                                &["bash", "-c", cmd],
-                                PopenConfig {
-                                    stderr: subprocess::Redirection::Merge,
-                                    stdin: subprocess::Redirection::Pipe,
-                                    stdout: subprocess::Redirection::Pipe,
-                                    detached: true,
-                                    ..PopenConfig::default()
-                                },
-                            )
-                            .ok(),
-                            Some(ref prev) => Popen::create(
-                                &["bash", "-c", cmd],
-                                PopenConfig {
-                                    stdin: subprocess::Redirection::File(
-                                        prev.stdout.as_ref()?.try_clone().ok()?,
-                                    ),
-                                    detached: true,
-                                    stdout: subprocess::Redirection::Pipe,
-                                    stderr: subprocess::Redirection::Merge,
-                                    ..PopenConfig::default()
-                                },
-                            )
-                            .ok(),
-                        })
-                    });
+                use std::rc::Rc;
 
-                let output_file: std::fs::File = popen_opt
-                    .ok_or("popen failed".to_string())
-                    .and_then(|pop| {
-                        pop.stdout
-                            .as_ref()
-                            .unwrap() // should never be None
-                            .try_clone()
-                            .to_string_result()
-                    })?;
+                let popen_opt: Vec<Rc<Popen>> = new_command
+                    .split('|')
+                    .scan(
+                        RefCell::new(None),
+                        |acc: &mut RefCell<Option<Rc<Popen>>>, cmd| {
+                            let popen = Some(Rc::new(match *acc.borrow() {
+                                None => Popen::create(
+                                    &["bash", "-c", cmd],
+                                    PopenConfig {
+                                        stderr: subprocess::Redirection::Merge,
+                                        stdin: subprocess::Redirection::Pipe,
+                                        stdout: subprocess::Redirection::Pipe,
+                                        detached: true,
+                                        ..PopenConfig::default()
+                                    },
+                                )
+                                .ok(),
+                                Some(ref prev) => Popen::create(
+                                    &["bash", "-c", cmd],
+                                    PopenConfig {
+                                        stdin: subprocess::Redirection::File(
+                                            (*prev).stdout.as_ref()?.try_clone().ok()?,
+                                        ),
+                                        detached: true,
+                                        stdout: subprocess::Redirection::Pipe,
+                                        stderr: subprocess::Redirection::Merge,
+                                        ..PopenConfig::default()
+                                    },
+                                )
+                                .ok(),
+                            }?));
+                            acc.replace(popen.clone());
+                            popen
+                        },
+                    )
+                    .collect();
+
+                if popen_opt.len() == 0 {
+                    return Ok(());
+                }
+
+                let output_file: std::fs::File = popen_opt[popen_opt.len() - 1]
+                    .stdout
+                    .as_ref()
+                    .unwrap() // should never be None
+                    .try_clone()
+                    .to_string_result()?;
 
                 let mut last_update = time::Instant::now();
                 for line in std::io::BufReader::new(output_file).lines() {
                     let mut line = line.to_string_result()?;
                     line.push('\n');
                     if (*stop_thread).load(Ordering::SeqCst) {
+                        for popen_rc in popen_opt {
+                            Rc::try_unwrap(popen_rc)
+                                .map_err(|_| "failed to unwrap popen".to_string())?
+                                .kill()
+                                .map_err(|_| "failed to kill".to_string())?;
+                        }
                         break;
                     }
 
@@ -155,7 +172,7 @@ fn subprocess_chan(
     });
 }
 
-fn event_chan(tx: mpsc::Sender<(Event, time::Instant)>) {
+fn event_chan(tx: crossbeam::Sender<(Event, time::Instant)>) {
     thread::spawn(move || {
         let stdin = io::stdin();
         for c in stdin.events() {
@@ -188,7 +205,8 @@ fn run() -> Result<String, String> {
     terminal.clear().to_string_result()?;
     // terminal.hide_cursor().to_string_result()?;
 
-    let (event_tx, event_rx) = mpsc::channel();
+    let (event_tx, event_rx) = crossbeam::channel::unbounded();
+    let (update_event_tx, update_event_rx) = crossbeam::channel::unbounded();
     let (command_tx, command_rx) = mpsc::channel();
 
     let global_state = Arc::new(Mutex::new(State {
@@ -197,19 +215,19 @@ fn run() -> Result<String, String> {
     }));
 
     event_chan(event_tx.clone());
-    subprocess_chan(global_state.clone(), event_tx.clone(), command_rx);
+    subprocess_chan(global_state.clone(), update_event_tx.clone(), command_rx);
 
     let mut command = String::new();
 
     let mut last_evt = time::Instant::now();
 
-
     loop {
-        match event_rx
-            .recv_timeout(std::time::Duration::from_millis(1000 / 2))
-            .map(|(evt, _)| evt)
-        {
-            Ok(evt) => match evt {
+        match crossbeam::select! {
+            recv(event_rx) -> msg => msg.map(Option::Some),
+            recv(update_event_rx) -> msg => msg.map(Option::Some),
+            default(std::time::Duration::from_millis(1000 / 2)) => Ok(None),
+        } {
+            Ok(Some((evt, _))) => match evt {
                 Event::Update => (),
                 Event::UserEvent(usr_evt) => match usr_evt {
                     UserEvent::Key(k) => {
@@ -251,7 +269,7 @@ fn run() -> Result<String, String> {
                     _ => (),
                 },
             },
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err("dead thread")?,
+            Err(crossbeam::RecvError) => Err("dead thread")?,
             _ => (),
         }
 
