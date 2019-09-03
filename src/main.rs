@@ -24,7 +24,7 @@ use tui::layout::{Constraint, Direction, Layout};
 use tui::widgets::{Block, Borders, Paragraph, Text, Widget};
 use tui::Terminal;
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use subprocess::{Popen, PopenConfig};
 
@@ -37,7 +37,22 @@ static MIN_UPDATE_REFRESH_RATE: std::time::Duration = MIN_REFRESH_RATE;
 
 struct State {
     text: Vec<String>,
+    cursor: usize,
     line: usize,
+    size: (u16, u16),
+    last_sent_command: String,
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            text: Vec::new(),
+            cursor: 0,
+            line: 0,
+            size: (0, 0),
+            last_sent_command: String::new(),
+        }
+    }
 }
 
 type GlobalState = Arc<Mutex<State>>;
@@ -50,7 +65,7 @@ enum Event {
 fn subprocess_chan(
     global_state: GlobalState,
     tx: crossbeam::Sender<(Event, time::Instant)>,
-    rx: mpsc::Receiver<String>,
+    rx: crossbeam::Receiver<String>,
 ) {
     use std::sync::atomic::*;
 
@@ -152,7 +167,7 @@ fn subprocess_chan(
                         .map(|mut state| {
                             state.text.push(line);
                             if !FLAGS.no_scroll {
-                                state.line += 1
+                                state.line = state.text.len();
                             }
                         })
                         .to_string_result()?;
@@ -160,7 +175,12 @@ fn subprocess_chan(
                     let time = time::Instant::now();
                     if time - last_update >= MIN_UPDATE_REFRESH_RATE {
                         last_update = time;
-                        new_tx.send((Event::Update, time)).unwrap();
+                        match new_tx.try_send((Event::Update, time)) {
+                            Err(crossbeam::TrySendError::Disconnected(_)) => {
+                                return Err("connection disconnected".to_string());
+                            }
+                            _ => (),
+                        };
                     }
                 }
 
@@ -184,7 +204,7 @@ fn event_chan(tx: crossbeam::Sender<(Event, time::Instant)>) {
 
 fn text(state: &mut State, num_lines: usize) -> impl Iterator<Item = &str> {
     let len = state.text.len();
-    let start_line = if state.line == len && len > 0 {
+    let start_line = if state.line >= len && len > 0 {
         len - num_lines.min(len)
     } else {
         state.line
@@ -196,6 +216,74 @@ fn text(state: &mut State, num_lines: usize) -> impl Iterator<Item = &str> {
         .map(|e| e.as_ref())
 }
 
+fn reduce_event(
+    evt: Event,
+    state: &mut State,
+    command: &mut String,
+    command_tx: &crossbeam::Sender<String>,
+) -> Result<bool, String> {
+    match evt {
+        Event::Update => (),
+        Event::UserEvent(usr_evt) => match usr_evt {
+            UserEvent::Key(k) => {
+                match k {
+                    Key::Ctrl('c') => return Ok(false),
+                    Key::Backspace => {
+                        // removing the character
+                        if state.cursor == command.len() {
+                            command.pop();
+                        } else if state.cursor > 0 {
+                            command.drain(state.cursor - 1..state.cursor);
+                        }
+                        // aligning the cursor
+                        if state.cursor > 0 {
+                            state.cursor -= 1;
+                        }
+                    }
+                    Key::Char('\r') | Key::Char('\n') => {
+                        state.last_sent_command = command.clone();
+                        command_tx.send(command.clone()).unwrap();
+                    }
+                    Key::Char(ch) => {
+                        if state.cursor == command.len() {
+                            command.push(ch);
+                        } else {
+                            command.insert(state.cursor, ch)
+                        }
+                        state.cursor += 1;
+                    }
+                    Key::Right => {
+                        state.cursor = (state.cursor + 1).min(command.len());
+                    }
+                    Key::Left => {
+                        state.cursor = if state.cursor == 0 {
+                            0
+                        } else {
+                            state.cursor - 1
+                        };
+                    }
+                    _ => (),
+                };
+            }
+            UserEvent::Mouse(MouseEvent::Press(btn, _, _)) => match btn {
+                MouseButton::WheelDown => {
+                    if state.line + 1 < state.text.len() {
+                        state.line += 1
+                    }
+                }
+                MouseButton::WheelUp => {
+                    if state.line != 0 {
+                        state.line -= 1
+                    }
+                }
+                _ => (),
+            },
+            _ => (),
+        },
+    };
+    Ok(true)
+}
+
 fn run() -> Result<String, String> {
     let stdout = io::stdout().into_raw_mode().unwrap();
     let stdout = MouseTerminal::from(stdout);
@@ -203,72 +291,38 @@ fn run() -> Result<String, String> {
     let backend = TermionBackend::new(stdout);
     let mut terminal = Terminal::new(backend).to_string_result()?;
     terminal.clear().to_string_result()?;
-    // terminal.hide_cursor().to_string_result()?;
 
     let (event_tx, event_rx) = crossbeam::channel::unbounded();
-    let (update_event_tx, update_event_rx) = crossbeam::channel::unbounded();
-    let (command_tx, command_rx) = mpsc::channel();
+    let (update_event_tx, update_event_rx) = crossbeam::channel::bounded(20);
+    let (command_tx, command_rx) = crossbeam::channel::unbounded();
+
+    let size = termion::terminal_size().map_err(|e| e.to_string())?;
 
     let global_state = Arc::new(Mutex::new(State {
-        text: Vec::new(),
-        line: 0,
+        size: size,
+        ..Default::default()
     }));
 
     event_chan(event_tx.clone());
     subprocess_chan(global_state.clone(), update_event_tx.clone(), command_rx);
 
     let mut command = String::new();
-
     let mut last_evt = time::Instant::now();
 
     loop {
-        match crossbeam::select! {
+        let msg = crossbeam::select! {
             recv(event_rx) -> msg => msg.map(Option::Some),
             recv(update_event_rx) -> msg => msg.map(Option::Some),
-            default(std::time::Duration::from_millis(1000 / 2)) => Ok(None),
-        } {
-            Ok(Some((evt, _))) => match evt {
-                Event::Update => (),
-                Event::UserEvent(usr_evt) => match usr_evt {
-                    UserEvent::Key(k) => {
-                        match k {
-                            Key::Ctrl('c') => break,
-                            Key::Backspace => {
-                                command.pop();
-                            }
-                            Key::Char('\r') | Key::Char('\n') => {
-                                command_tx.send(command.clone()).unwrap();
-                            }
-                            Key::Char(ch) => command.push(ch),
-                            _ => (),
-                        };
-                    }
-                    UserEvent::Mouse(MouseEvent::Press(btn, _, _)) => match btn {
-                        MouseButton::WheelDown => {
-                            global_state
-                                .lock()
-                                .map(|mut state| {
-                                    if state.line + 1 < state.text.len() {
-                                        state.line += 1
-                                    }
-                                })
-                                .to_string_result()?;
-                        }
-                        MouseButton::WheelUp => {
-                            global_state
-                                .lock()
-                                .map(|mut state| {
-                                    if state.line != 0 {
-                                        state.line -= 1
-                                    }
-                                })
-                                .to_string_result()?;
-                        }
-                        _ => (),
-                    },
-                    _ => (),
-                },
-            },
+            default(std::time::Duration::from_millis(1000 / 2)) => Ok(None)
+        };
+
+        match msg {
+            Ok(Some((evt, _))) => {
+                let mut state = global_state.lock().unwrap();
+                if !reduce_event(evt, &mut *state, &mut command, &command_tx)? {
+                    break;
+                }
+            }
             Err(crossbeam::RecvError) => Err("dead thread")?,
             _ => (),
         }
@@ -287,8 +341,11 @@ fn run() -> Result<String, String> {
                     .constraints([Constraint::Length(2), Constraint::Percentage(90)].as_ref())
                     .split(f.size());
 
+                let rect = f.size();
                 // title bar
                 let state = &mut global_state.lock().unwrap();
+                state.size = (rect.height, rect.width);
+
                 let title = vec![Text::raw(&command)];
                 Paragraph::new(title.iter())
                     .block(Block::default().borders(Borders::TOP | Borders::RIGHT | Borders::LEFT))
@@ -296,7 +353,7 @@ fn run() -> Result<String, String> {
                     .render(&mut f, chunks[0]);
 
                 // text drawing
-                let text: Vec<Text> = text(&mut *state, chunks[1].height as usize)
+                let text: Vec<Text> = text(&mut *state, chunks[1].height as usize - 2)
                     .map(Text::raw)
                     .collect();
                 Paragraph::new(text.iter())
@@ -306,11 +363,13 @@ fn run() -> Result<String, String> {
             })
             .to_string_result()?;
 
+        let state = global_state.lock().unwrap();
         terminal
-            .set_cursor(command.len() as u16 + 1, 1)
+            .set_cursor(state.cursor as u16 + 1, 1)
             .to_string_result()?;
     }
-    Ok(command)
+    let last_command = (*global_state.lock().unwrap()).last_sent_command.clone();
+    Ok(last_command)
 }
 
 pub fn main() -> Result<(), String> {
