@@ -96,52 +96,27 @@ fn subprocess_chan(
             let new_tx = tx.clone();
 
             thread::spawn(move || -> Result<(), String> {
-                use std::cell::RefCell;
                 use std::io::prelude::*;
-                use std::rc::Rc;
 
-                let popen_opt: Vec<Rc<Popen>> = new_command
-                    .split('|')
-                    .scan(
-                        RefCell::new(None),
-                        |acc: &mut RefCell<Option<Rc<Popen>>>, cmd| {
-                            let popen = Some(Rc::new(match *acc.borrow() {
-                                None => Popen::create(
-                                    &["bash", "-c", cmd],
-                                    PopenConfig {
-                                        stderr: subprocess::Redirection::Merge,
-                                        stdin: subprocess::Redirection::Pipe,
-                                        stdout: subprocess::Redirection::Pipe,
-                                        detached: true,
-                                        ..PopenConfig::default()
-                                    },
-                                )
-                                .ok(),
-                                Some(ref prev) => Popen::create(
-                                    &["bash", "-c", cmd],
-                                    PopenConfig {
-                                        stdin: subprocess::Redirection::File(
-                                            (*prev).stdout.as_ref()?.try_clone().ok()?,
-                                        ),
-                                        detached: true,
-                                        stdout: subprocess::Redirection::Pipe,
-                                        stderr: subprocess::Redirection::Merge,
-                                        ..PopenConfig::default()
-                                    },
-                                )
-                                .ok(),
-                            }?));
-                            acc.replace(popen.clone());
-                            popen
-                        },
-                    )
-                    .collect();
+                let popen_opt = Popen::create(
+                    &[FLAGS.shell.as_ref(), "-c", &new_command],
+                    PopenConfig {
+                        stderr: subprocess::Redirection::Merge,
+                        stdin: subprocess::Redirection::Pipe,
+                        stdout: subprocess::Redirection::Pipe,
+                        detached: true,
+                        ..PopenConfig::default()
+                    },
+                )
+                .ok();
 
-                if popen_opt.len() == 0 {
-                    return Ok(());
+                if let None = popen_opt {
+                    return Err("bad command".to_string());
                 }
 
-                let output_file: std::fs::File = popen_opt[popen_opt.len() - 1]
+                let output_file: std::fs::File = popen_opt
+                    .as_ref()
+                    .unwrap()
                     .stdout
                     .as_ref()
                     .unwrap() // should never be None
@@ -153,12 +128,10 @@ fn subprocess_chan(
                     let mut line = line.to_string_result()?;
                     line.push('\n');
                     if (*stop_thread).load(Ordering::SeqCst) {
-                        for popen_rc in popen_opt {
-                            Rc::try_unwrap(popen_rc)
-                                .map_err(|_| "failed to unwrap popen".to_string())?
-                                .kill()
-                                .map_err(|_| "failed to kill".to_string())?;
-                        }
+                        popen_opt
+                            .unwrap()
+                            .kill()
+                            .map_err(|_| "failed to kill".to_string())?;
                         break;
                     }
 
@@ -268,12 +241,13 @@ fn reduce_event(
             UserEvent::Mouse(MouseEvent::Press(btn, _, _)) => match btn {
                 MouseButton::WheelDown => {
                     if state.line + 1 < state.text.len() {
-                        state.line += 1
+                        state.line =
+                            (state.line + FLAGS.scroll_speed as usize).min(state.text.len())
                     }
                 }
                 MouseButton::WheelUp => {
                     if state.line != 0 {
-                        state.line -= 1
+                        state.line -= state.line.min(FLAGS.scroll_speed as usize)
                     }
                 }
                 _ => (),
@@ -284,7 +258,7 @@ fn reduce_event(
     Ok(true)
 }
 
-fn run() -> Result<String, String> {
+fn run() -> Result<State, String> {
     let stdout = io::stdout().into_raw_mode().unwrap();
     let stdout = MouseTerminal::from(stdout);
     let stdout = AlternateScreen::from(stdout);
@@ -368,13 +342,16 @@ fn run() -> Result<String, String> {
             .set_cursor(state.cursor as u16 + 1, 1)
             .to_string_result()?;
     }
-    let last_command = (*global_state.lock().unwrap()).last_sent_command.clone();
-    Ok(last_command)
+
+    let mut state = global_state.lock().unwrap();
+    Ok(std::mem::replace(&mut state, Default::default()))
 }
 
 pub fn main() -> Result<(), String> {
     FLAGS.no_scroll;
-    run().map(|command| {
-        println!("{}", command);
+    run().map(|state: State| {
+        for line in state.text.iter() {
+            print!("{}", line);
+        }
     })
 }
